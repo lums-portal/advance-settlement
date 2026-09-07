@@ -483,6 +483,22 @@
             alert("Settlement request rejected and sent back to the employee with intimation.");
           }
 
+          // Owner Master Reset Function
+          function triggerMasterReset() {
+            const ownerPin = prompt("Enter Owner Master PIN to wipe all local data:");
+            if (ownerPin === "LUMS2026") {
+              const confirmWipe = confirm("WARNING: This will completely erase all saved portal data and reset to default. Proceed?");
+              if (confirmWipe) {
+                localStorage.removeItem("lums_employees");
+                localStorage.removeItem("lums_advances");
+                alert("Master reset successful. Reloading portal.");
+                location.reload();
+              }
+            } else if (ownerPin !== null) {
+              alert("Access Denied: Incorrect PIN.");
+            }
+          }
+
           const currentEmp = employees.find(e => e.id === currentEmployeeId) || employees[0];
           const myAdvances = advances.filter((a) => a.employeeId === currentEmployeeId);
           const hodQueue = advances.filter((a) => a.status === "pending_hod");
@@ -1330,6 +1346,16 @@
                 )}
 
               </div>
+
+              {/* Discreet Owner Master Reset Button */}
+              <button 
+                onClick={triggerMasterReset} 
+                title="Owner Master Reset Switch"
+                style={{ opacity: 0.15, transition: "opacity 0.2s" }}
+                className="fixed bottom-3 right-3 bg-red-600 text-white px-2.5 py-1.5 rounded text-[10px] font-bold shadow hover:opacity-100 z-50 cursor-pointer"
+              >
+                🔒 Master Reset
+              </button>
             </div>
           );
         }
