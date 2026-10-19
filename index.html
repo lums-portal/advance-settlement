@@ -110,6 +110,29 @@
         ];
 
         const CATEGORIES = ["Travel", "Lodging", "Meals", "Supplies", "Other"];
+
+        // Reasons Accounts can select when reviewing / rejecting an advance request
+        const ACCOUNTS_REVIEW_REASONS = [
+          "Previous advance settlement is still pending",
+          "Stated purpose of the advance is not justified",
+          "Requested amount exceeds approved limits",
+          "Advance violates LUMS policies"
+        ];
+
+        // ---- SAP INTEGRATION PLACEHOLDER ----
+        // Returns true only if the employee holds an active grant AND has PR creation rights for it.
+        // Currently always false, so the "Grant Fund" button is shown greyed out.
+        // Later, replace the body of this function with the SAP authorisation lookup.
+        function hasGrantFundAccess(employee) {
+          return false;
+        }
+
+        // Placeholder email resolver. Replace with the real email from the employee master data / SAP.
+        function empEmail(emp) {
+          if (!emp) return "";
+          if (emp.email) return emp.email;
+          return `${emp.name.toLowerCase().replace(/\s+/g, ".")}@lums.edu.pk`;
+        }
         
         function money(n) { return `PKR ${Number(n || 0).toLocaleString()}`; }
         function daysAgo(dateStr) { 
@@ -246,6 +269,13 @@
               lines: [{ id: 104, description: "Airfare & hotel", category: "Travel", amount: 130000, fileName: "travel_receipt.pdf", fileUrl: "" }] 
             }, sapDocRef: "FI-DOC-91283", disbursementRef: "TXN-55419",
             settlementMode: null, refundDetails: null, rejectionReason: null
+          },
+          {
+            id: 16, employeeId: "e3", prNumber: "PR-340000016", amount: 75000,
+            dept: "Admissions", fundCenterNum: "CUF1018011", fundCenterName: "Admissions",
+            purpose: "Open day marketing material printing", disbursedOn: null,
+            status: "pending_accounts", claim: { lines: [] }, sapDocRef: null, disbursementRef: null,
+            settlementMode: null, refundDetails: null, rejectionReason: null
           }
         ];
 
@@ -278,6 +308,7 @@
           });
           
           const [showNewForm, setShowNewForm] = useState(false);
+          const [newFundType, setNewFundType] = useState("current");
           const [newAmount, setNewAmount] = useState("");
           const [newPurpose, setNewPurpose] = useState("");
 
@@ -295,6 +326,15 @@
 
           const [financeSelectedId, setFinanceSelectedId] = useState(null);
           const [financeRejectReason, setFinanceRejectReason] = useState("");
+
+          // Accounts: advance eligibility review (new step before Treasury)
+          const [financeTab, setFinanceTab] = useState("advance_review");
+          const [reviewSelectedId, setReviewSelectedId] = useState(null);
+          const [reviewReasons, setReviewReasons] = useState([]);
+          const [reviewOtherText, setReviewOtherText] = useState("");
+
+          // Admin dashboard: email reminders
+          const [selectedReminderIds, setSelectedReminderIds] = useState([]);
 
           const [hodSelectedFc, setHodSelectedFc] = useState("ALL");
           const [settlementChoices, setSettlementChoices] = useState({ 2: { mode: "salary_deduction", ref: "", fileName: "" } });
@@ -415,6 +455,10 @@
               alert("Access Denied: Profile is undergoing Budget & IT vetting and is not yet active.");
               return;
             }
+            if (newFundType === "grant" && !hasGrantFundAccess(emp)) {
+              alert("Access Denied: You do not have an active grant fund authorisation for PR creation.");
+              return;
+            }
             if (!newAmount || !newPurpose) return;
 
             const nextPr = generateNextPrNumber();
@@ -423,7 +467,8 @@
               amount: Number(newAmount), dept: emp.dept, fundCenterNum: emp.fundCenterNum,
               fundCenterName: emp.fundCenterName, purpose: newPurpose, disbursedOn: null,
               status: "pending_hod", claim: { lines: [] }, sapDocRef: null, disbursementRef: null,
-              settlementMode: null, refundDetails: null, rejectionReason: null
+              settlementMode: null, refundDetails: null, rejectionReason: null,
+              fundType: newFundType
             };
             setAdvances([newAdv, ...advances]);
             setNewAmount(""); setNewPurpose(""); setShowNewForm(false);
@@ -431,7 +476,42 @@
 
           function hodAction(id, approve) {
             if (!approve) { setAdvances(advances.filter(a => a.id !== id)); } 
-            else { update(id, { status: "pending_treasury" }); }
+            else { update(id, { status: "pending_accounts" }); }
+          }
+
+          // ---- Accounts: advance eligibility review ----
+          function toggleReviewReason(reason) {
+            setReviewReasons(prev => prev.includes(reason) ? prev.filter(r => r !== reason) : [...prev, reason]);
+          }
+
+          function resetReviewForm() {
+            setReviewReasons([]);
+            setReviewOtherText("");
+          }
+
+          function accountsApproveAdvance(id) {
+            const today = new Date().toISOString().split('T')[0];
+            update(id, { status: "pending_treasury", accountsReviewedOn: today, rejectionReasons: [], rejectionNote: "" });
+            resetReviewForm();
+            setReviewSelectedId(null);
+            alert("Advance request cleared by Accounts and forwarded to Treasury for disbursement.");
+          }
+
+          function accountsRejectAdvance(id) {
+            if (reviewReasons.length === 0 && !reviewOtherText.trim()) {
+              alert("Please select at least one reason or enter a reason manually before rejecting the advance request.");
+              return;
+            }
+            const today = new Date().toISOString().split('T')[0];
+            update(id, {
+              status: "rejected",
+              rejectionReasons: reviewReasons,
+              rejectionNote: reviewOtherText.trim(),
+              advanceRejectedOn: today
+            });
+            resetReviewForm();
+            setReviewSelectedId(null);
+            alert("Advance request rejected. The employee will see the rejection reasons in their portal.");
           }
 
           function confirmTreasuryDisbursement(id) {
@@ -483,9 +563,37 @@
             alert("Settlement request rejected and sent back to the employee with intimation.");
           }
 
+          // ---- Admin dashboard: settlement reminder emails ----
+          function toggleReminderSelect(id) {
+            setSelectedReminderIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+          }
+
+          function sendReminderEmails(list) {
+            if (list.length === 0) {
+              alert("No pending advances selected for reminders.");
+              return;
+            }
+            const recipients = list.map(a => {
+              const emp = empOf(a);
+              return `• ${emp ? emp.name : "Unknown"} <${empEmail(emp)}> — ${a.prNumber} (${money(a.amount)}, ${daysAgo(a.disbursedOn)} days outstanding)`;
+            }).join("\n");
+            if (!confirm(`Send settlement reminder email for ${list.length} advance(s)?\n\n${recipients}`)) return;
+
+            // ---- EMAIL INTEGRATION POINT ----
+            // Call your email service / backend endpoint here for each advance in `list`
+            // (recipient: empEmail(empOf(a)), subject/body referencing a.prNumber, a.amount, days outstanding).
+            // Below, the reminder is only recorded in the portal.
+            const today = new Date().toISOString().split('T')[0];
+            const ids = list.map(a => a.id);
+            setAdvances(as => as.map(a => ids.includes(a.id) ? { ...a, lastReminderOn: today, reminderCount: (a.reminderCount || 0) + 1 } : a));
+            setSelectedReminderIds([]);
+            alert(`Settlement reminder sent for ${list.length} advance(s).`);
+          }
+
           const currentEmp = employees.find(e => e.id === currentEmployeeId) || employees[0];
           const myAdvances = advances.filter((a) => a.employeeId === currentEmployeeId);
           const hodQueue = advances.filter((a) => a.status === "pending_hod");
+          const accountsReviewQueue = advances.filter((a) => a.status === "pending_accounts");
           const treasuryQueue = advances.filter((a) => a.status === "pending_treasury");
           const submittedQueue = advances.filter((a) => a.status === "submitted");
 
@@ -534,6 +642,9 @@
           const summaryPartialAdvances = applyAgingAndSorting(rawPartialAdvances);
           const summarySettledPRs = applyAgingAndSorting(rawSettledPRs);
 
+          const selectedVisibleReminders = summaryOpenAdvances.filter(a => selectedReminderIds.includes(a.id));
+          const allVisibleSelected = summaryOpenAdvances.length > 0 && selectedVisibleReminders.length === summaryOpenAdvances.length;
+
           const agingBuckets = { "<1 month": 0, "<3 months": 0, "<6 months": 0, "+6 months": 0 };
           rawOpenAdvances.forEach(a => {
             if (a.disbursedOn) {
@@ -569,8 +680,8 @@
                     <button onClick={() => { setRole("treasury"); setTreasurySelectedId(treasuryQueue[0]?.id || null); }} className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${role === "treasury" ? "bg-white text-[#001b4d] shadow-sm font-bold" : "text-slate-500"}`}>
                       💰 Treasury {treasuryQueue.length > 0 && <span className="ml-1 bg-blue-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{treasuryQueue.length}</span>}
                     </button>
-                    <button onClick={() => { setRole("finance"); setFinanceSelectedId(submittedQueue[0]?.id || null); }} className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${role === "finance" ? "bg-white text-[#001b4d] shadow-sm font-bold" : "text-slate-500"}`}>
-                      🏛️ Accounts {submittedQueue.length > 0 && <span className="ml-1 bg-purple-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{submittedQueue.length}</span>}
+                    <button onClick={() => { setRole("finance"); setFinanceSelectedId(submittedQueue[0]?.id || null); setReviewSelectedId(accountsReviewQueue[0]?.id || null); resetReviewForm(); }} className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${role === "finance" ? "bg-white text-[#001b4d] shadow-sm font-bold" : "text-slate-500"}`}>
+                      🏛️ Accounts {(submittedQueue.length + accountsReviewQueue.length) > 0 && <span className="ml-1 bg-purple-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{submittedQueue.length + accountsReviewQueue.length}</span>}
                     </button>
                     <button onClick={() => setRole("admin_summary")} className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${role === "admin_summary" ? "bg-white text-[#001b4d] shadow-sm font-bold" : "text-slate-500"}`}>
                       📊 Admin Dashboard
@@ -590,14 +701,40 @@
                           {employees.map((e) => <option key={e.id} value={e.id}>{e.name} ({e.role}) — {e.fundCenterNum} {e.workflowStatus === 'active' ? '✓' : `(${e.workflowStatus})`}</option>)}
                         </select>
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         <button onClick={() => setShowProfileForm(!showProfileForm)} className="bg-slate-200 hover:bg-slate-300 text-slate-800 px-3 py-2 rounded-lg text-xs font-bold transition-colors">
                           {showProfileForm ? "Close Profile Form" : "➕ Create Employee Profile"}
                         </button>
                         {currentEmp && currentEmp.workflowStatus === 'active' ? (
-                          <button onClick={() => setShowNewForm(!showNewForm)} className="bg-[#001b4d] text-white px-4 py-2 rounded-lg text-xs font-bold hover:bg-blue-900 transition-colors shadow-sm">
-                            {showNewForm ? "Cancel PR" : "➕ Apply for Advance (PR)"}
-                          </button>
+                          <>
+                            <button
+                              onClick={() => {
+                                if (showNewForm && newFundType === "current") { setShowNewForm(false); }
+                                else { setNewFundType("current"); setShowNewForm(true); }
+                              }}
+                              className="bg-[#001b4d] text-white px-4 py-2 rounded-lg text-xs font-bold hover:bg-blue-900 transition-colors shadow-sm"
+                            >
+                              {showNewForm && newFundType === "current" ? "Cancel PR" : "➕ Apply for Advance - Current Fund"}
+                            </button>
+                            <button
+                              disabled={!hasGrantFundAccess(currentEmp)}
+                              title={hasGrantFundAccess(currentEmp) ? "Create a PR against an authorised grant fund" : "Not available: no active grant fund authorisation / PR creation rights (to be configured via SAP integration)"}
+                              onClick={() => {
+                                if (!hasGrantFundAccess(currentEmp)) return;
+                                if (showNewForm && newFundType === "grant") { setShowNewForm(false); }
+                                else { setNewFundType("grant"); setShowNewForm(true); }
+                              }}
+                              className={`px-4 py-2 rounded-lg text-xs font-bold transition-colors border ${
+                                hasGrantFundAccess(currentEmp)
+                                  ? "bg-[#001b4d] text-white hover:bg-blue-900 shadow-sm border-transparent"
+                                  : "bg-slate-100 text-slate-400 border-slate-300 cursor-not-allowed opacity-70"
+                              }`}
+                            >
+                              {hasGrantFundAccess(currentEmp)
+                                ? (showNewForm && newFundType === "grant" ? "Cancel PR" : "➕ Apply for Advance - Grant Fund")
+                                : "🔒 Apply for Advance - Grant Fund"}
+                            </button>
+                          </>
                         ) : (
                           <span className="text-xs bg-amber-50 text-amber-800 border border-amber-200 px-3 py-2 rounded-lg font-medium">
                             ⚠️ Profile undergoing Budget & IT vetting
@@ -657,7 +794,9 @@
                     {showNewForm && currentEmp && currentEmp.workflowStatus === 'active' && (
                       <div className="bg-white border border-blue-200 rounded-xl p-5 shadow-md">
                         <div className="flex justify-between items-center mb-3">
-                          <h3 className="text-sm font-bold text-[#001b4d]">Create Sequential Purchase Requisition (PR)</h3>
+                          <h3 className="text-sm font-bold text-[#001b4d]">
+                            Create Sequential Purchase Requisition (PR) — {newFundType === "grant" ? "Grant Fund" : "Current Fund"}
+                          </h3>
                           <span className="text-xs font-mono bg-slate-100 px-2 py-1 rounded text-slate-600">Next PR: {generateNextPrNumber()}</span>
                         </div>
                         <form onSubmit={submitNewApplication} className="space-y-3 text-xs">
@@ -709,15 +848,19 @@
                               </div>
                               <span className={`px-3 py-1 rounded-full text-xs font-semibold border ${
                                 a.status === 'pending_hod' ? 'bg-amber-50 text-amber-700 border-amber-200' :
+                                a.status === 'pending_accounts' ? 'bg-cyan-50 text-cyan-700 border-cyan-200' :
                                 a.status === 'pending_treasury' ? 'bg-blue-50 text-blue-700 border-blue-200' :
                                 a.status === 'outstanding' ? 'bg-indigo-50 text-indigo-700 border-indigo-200' : 
                                 a.status === 'submitted' ? 'bg-purple-50 text-purple-700 border-purple-200' : 
+                                a.status === 'rejected' ? 'bg-red-50 text-red-700 border-red-200' :
                                 'bg-green-50 text-green-700 border-green-200'
                               }`}>
                                 {a.status === 'pending_hod' ? 'Pending HoD' : 
+                                 a.status === 'pending_accounts' ? 'Pending Accounts Review' : 
                                  a.status === 'pending_treasury' ? 'Pending Treasury' : 
                                  a.status === 'outstanding' ? 'Outstanding' : 
-                                 a.status === 'submitted' ? 'Pending Audit' : `Settled (${a.sapDocRef})`}
+                                 a.status === 'submitted' ? 'Pending Audit' : 
+                                 a.status === 'rejected' ? 'Rejected by Accounts' : `Settled (${a.sapDocRef})`}
                               </span>
                             </div>
 
@@ -728,6 +871,22 @@
                                   <div className="bg-white border p-3 rounded-lg"><span className="text-slate-400 block">Fund Center:</span><span className="font-bold text-[#001b4d]">{a.fundCenterNum} ({a.fundCenterName})</span></div>
                                   <div className="bg-white border p-3 rounded-lg"><span className="text-slate-400 block">Department Unit:</span><span className="font-bold text-slate-700">{a.dept}</span></div>
                                 </div>
+
+                                {a.status === "rejected" && (
+                                  <div className="bg-red-50 border border-red-300 rounded-lg p-4 text-xs text-red-900 space-y-2">
+                                    <div className="font-bold flex items-center gap-1.5 text-red-800">
+                                      <span>⚠️ Advance Request Rejected by Accounts{a.advanceRejectedOn ? ` on ${a.advanceRejectedOn}` : ""}</span>
+                                    </div>
+                                    {(a.rejectionReasons || []).length > 0 && (
+                                      <ul className="list-disc pl-5 text-red-700 space-y-0.5">
+                                        {a.rejectionReasons.map(r => <li key={r}>{r}</li>)}
+                                      </ul>
+                                    )}
+                                    {a.rejectionNote && (
+                                      <p className="text-red-700"><strong>Accounts Remarks:</strong> {a.rejectionNote}</p>
+                                    )}
+                                  </div>
+                                )}
 
                                 {a.status === "outstanding" && a.rejectionReason && (
                                   <div className="bg-red-50 border border-red-300 rounded-lg p-4 text-xs text-red-900 space-y-1">
@@ -900,7 +1059,7 @@
                                 </div>
                                 <div className="flex gap-2">
                                   <button onClick={() => hodAction(a.id, false)} className="bg-red-50 text-red-700 border border-red-200 px-4 py-2 rounded font-bold">Reject</button>
-                                  <button onClick={() => hodAction(a.id, true)} className="bg-green-600 text-white px-4 py-2 rounded font-bold shadow-sm">Approve & Forward to Treasury</button>
+                                  <button onClick={() => hodAction(a.id, true)} className="bg-green-600 text-white px-4 py-2 rounded font-bold shadow-sm">Approve & Forward to Accounts</button>
                                 </div>
                               </div>
                             );
@@ -1009,7 +1168,7 @@
                 {role === "treasury" && (
                   <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
                     <h3 className="text-base font-bold text-[#001b4d] mb-1">Treasury Payout & Bank Disbursement</h3>
-                    <p className="text-xs text-slate-500 mb-4">Confirm bank transfer references for HoD-approved advances.</p>
+                    <p className="text-xs text-slate-500 mb-4">Confirm bank transfer references for advances approved by HoD and cleared by Accounts.</p>
                     {treasuryQueue.length === 0 ? (
                       <div className="border border-dashed border-slate-200 rounded-lg p-8 text-center bg-slate-50 text-sm text-slate-500">No approved advances pending treasury disbursement.</div>
                     ) : (
@@ -1064,8 +1223,113 @@
                 {role === "finance" && (
                   <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
                     <h3 className="text-base font-bold text-[#001b4d] mb-1">Accounts Vetting & Audit Queue</h3>
-                    <p className="text-xs text-slate-500 mb-4">Audit employee claims, receipts, and deposit slip / cheque proofs against Fund Centers. Approve or reject settlements with reasons.</p>
-                    {submittedQueue.length === 0 ? (
+                    <p className="text-xs text-slate-500 mb-4">Review advance requests for eligibility before Treasury disbursement, and audit employee claims, receipts, and deposit slip / cheque proofs against Fund Centers. Approve or reject with reasons.</p>
+
+                    <div className="flex bg-slate-100 p-1 rounded-lg border border-slate-200 gap-1 mb-5 w-fit">
+                      <button onClick={() => setFinanceTab("advance_review")} className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${financeTab === "advance_review" ? "bg-white text-[#001b4d] shadow-sm font-bold" : "text-slate-500"}`}>
+                        📝 Advance Eligibility Review {accountsReviewQueue.length > 0 && <span className="ml-1 bg-cyan-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{accountsReviewQueue.length}</span>}
+                      </button>
+                      <button onClick={() => setFinanceTab("settlement_audit")} className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${financeTab === "settlement_audit" ? "bg-white text-[#001b4d] shadow-sm font-bold" : "text-slate-500"}`}>
+                        🧾 Settlement Audit {submittedQueue.length > 0 && <span className="ml-1 bg-purple-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{submittedQueue.length}</span>}
+                      </button>
+                    </div>
+
+                    {financeTab === "advance_review" && (
+                      accountsReviewQueue.length === 0 ? (
+                        <div className="border border-dashed border-slate-200 rounded-lg p-8 text-center bg-slate-50 text-sm text-slate-500">No advance requests currently pending Accounts eligibility review.</div>
+                      ) : (
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                          <div className="border border-slate-200 rounded-lg divide-y divide-slate-100 overflow-hidden bg-white">
+                            <div className="bg-slate-50 px-3 py-2 text-xs font-bold text-slate-500 uppercase">Awaiting Review ({accountsReviewQueue.length})</div>
+                            {accountsReviewQueue.map(item => {
+                              const emp = empOf(item);
+                              const isSelected = reviewSelectedId === item.id;
+                              return (
+                                <button key={item.id} onClick={() => { setReviewSelectedId(item.id); resetReviewForm(); }} className={`w-full text-left p-3 transition-colors ${isSelected ? 'bg-blue-50/80 border-l-4 border-[#001b4d]' : 'hover:bg-slate-50'}`}>
+                                  <div className="text-sm font-bold text-[#001b4d]">{emp?.name}</div>
+                                  <div className="text-xs text-slate-500 truncate">{item.purpose}</div>
+                                  <div className="mt-1 text-xs font-mono text-indigo-700 font-bold">{item.prNumber} · {money(item.amount)}</div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <div className="md:col-span-2 border border-slate-200 rounded-lg p-5 bg-white shadow-2xs">
+                            {reviewSelectedId ? (() => {
+                              const target = accountsReviewQueue.find(i => i.id === reviewSelectedId);
+                              if (!target) return <div className="p-8 text-center text-xs text-slate-400">Select advance request from the queue.</div>;
+                              const emp = empOf(target);
+                              const otherPending = advances.filter(x => x.employeeId === target.employeeId && x.id !== target.id && (x.status === "outstanding" || x.status === "submitted"));
+                              const otherPendingTotal = otherPending.reduce((s, x) => s + Number(x.amount), 0);
+
+                              return (
+                                <div className="space-y-4 text-xs">
+                                  <div className="flex justify-between items-start border-b pb-3">
+                                    <div>
+                                      <h4 className="text-sm font-bold text-[#001b4d]">{target.purpose}</h4>
+                                      <p className="text-slate-500">Employee: <strong>{emp?.name}</strong> ({emp?.role}) · FC: <span className="font-mono text-[#001b4d]">{target.fundCenterNum} ({target.fundCenterName})</span></p>
+                                    </div>
+                                    <span className="bg-cyan-100 text-cyan-800 text-xs px-2.5 py-1 rounded-full font-bold">Pending Accounts Review</span>
+                                  </div>
+
+                                  <div className="bg-slate-50 p-4 rounded-lg border space-y-2">
+                                    <div className="flex justify-between"><span>PR Number:</span><span className="font-mono font-bold text-indigo-700">{target.prNumber}</span></div>
+                                    <div className="flex justify-between"><span>Requested Amount:</span><span className="font-bold text-base text-[#001b4d]">{money(target.amount)}</span></div>
+                                  </div>
+
+                                  <div className={`p-3.5 rounded-lg border ${otherPending.length > 0 ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-green-50 border-green-200 text-green-800'}`}>
+                                    {otherPending.length > 0 ? (
+                                      <div className="space-y-1">
+                                        <div className="font-bold">⚠️ {emp?.name} has {otherPending.length} previous advance(s) not yet settled ({money(otherPendingTotal)})</div>
+                                        {otherPending.map(x => (
+                                          <div key={x.id} className="font-mono text-[11px]">{x.prNumber} · {money(x.amount)} · {x.disbursedOn ? `${daysAgo(x.disbursedOn)} days outstanding` : 'not yet disbursed'} · {x.status === 'submitted' ? 'Pending Audit' : 'Outstanding'}</div>
+                                        ))}
+                                      </div>
+                                    ) : (
+                                      <div className="font-bold">✓ No previous unsettled advances found for this employee.</div>
+                                    )}
+                                  </div>
+
+                                  <div className="border border-slate-200 p-3.5 rounded-lg space-y-2">
+                                    <div className="font-bold text-slate-700">Rejection Reasons (select all that apply — required only when rejecting):</div>
+                                    <div className="space-y-1.5">
+                                      {ACCOUNTS_REVIEW_REASONS.map(r => (
+                                        <label key={r} className="flex items-center gap-2 cursor-pointer">
+                                          <input type="checkbox" checked={reviewReasons.includes(r)} onChange={() => toggleReviewReason(r)} />
+                                          <span>{r}</span>
+                                        </label>
+                                      ))}
+                                      <label className="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" checked={reviewReasons.includes("Other")} onChange={() => toggleReviewReason("Other")} />
+                                        <span>Other (please specify below)</span>
+                                      </label>
+                                    </div>
+                                    <textarea
+                                      rows="2"
+                                      value={reviewOtherText}
+                                      onChange={e => setReviewOtherText(e.target.value)}
+                                      placeholder="Enter any additional reason or remarks for the employee..."
+                                      className="w-full border border-slate-300 rounded p-2 text-xs bg-white focus:outline-none focus:ring-1 focus:ring-slate-500"
+                                    />
+                                  </div>
+
+                                  <div className="pt-2 flex justify-end gap-2 border-t">
+                                    <button onClick={() => accountsRejectAdvance(target.id)} className="bg-red-600 hover:bg-red-700 text-white px-4 py-2.5 rounded-lg font-bold shadow-sm">
+                                      ❌ Reject Advance Request
+                                    </button>
+                                    <button onClick={() => accountsApproveAdvance(target.id)} className="bg-[#001b4d] hover:bg-blue-900 text-white px-5 py-2.5 rounded-lg font-bold shadow-sm">
+                                      ✅ No Objection — Forward to Treasury
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })() : <div className="p-8 text-center text-xs text-slate-400">Select advance request from the queue.</div>}
+                          </div>
+                        </div>
+                      )
+                    )}
+
+                    {financeTab === "settlement_audit" && (
+                    submittedQueue.length === 0 ? (
                       <div className="border border-dashed border-slate-200 rounded-lg p-8 text-center bg-slate-50 text-sm text-slate-500">No claims currently pending accounts audit.</div>
                     ) : (
                       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -1161,6 +1425,7 @@
                           })() : <div className="p-8 text-center text-xs text-slate-400">Select submission from left.</div>}
                         </div>
                       </div>
+                    )
                     )}
                   </div>
                 )}
@@ -1246,6 +1511,34 @@
                           </div>
                           {summaryDropdownOpen.open && (
                             <div className="p-4 bg-white space-y-2">
+                              {summaryOpenAdvances.length > 0 && (
+                                <div className="flex flex-wrap justify-between items-center gap-3 bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs mb-3">
+                                  <label className="flex items-center gap-2 cursor-pointer font-bold text-[#001b4d]">
+                                    <input
+                                      type="checkbox"
+                                      checked={allVisibleSelected}
+                                      onChange={() => setSelectedReminderIds(allVisibleSelected ? [] : summaryOpenAdvances.map(a => a.id))}
+                                    />
+                                    <span>Select all shown ({summaryOpenAdvances.length})</span>
+                                  </label>
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="text-slate-500">📧 Settlement Reminder Emails:</span>
+                                    <button
+                                      disabled={selectedVisibleReminders.length === 0}
+                                      onClick={() => sendReminderEmails(selectedVisibleReminders)}
+                                      className={`px-3 py-1.5 rounded font-bold border ${selectedVisibleReminders.length === 0 ? "bg-slate-100 text-slate-400 border-slate-300 cursor-not-allowed" : "bg-white text-[#001b4d] border-[#001b4d] hover:bg-slate-50"}`}
+                                    >
+                                      Send to Selected ({selectedVisibleReminders.length})
+                                    </button>
+                                    <button
+                                      onClick={() => sendReminderEmails(summaryOpenAdvances)}
+                                      className="bg-[#001b4d] hover:bg-blue-900 text-white px-3 py-1.5 rounded font-bold shadow-sm"
+                                    >
+                                      {selectedAgingBucket ? `Send to All in "${selectedAgingBucket}" (${summaryOpenAdvances.length})` : `Send to All Pending Advances (${summaryOpenAdvances.length})`}
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
                               {summaryOpenAdvances.length === 0 ? <p className="text-xs text-slate-400">No open advances matching filter criteria.</p> : (
                                 summaryOpenAdvances.map(a => {
                                   const emp = empOf(a);
@@ -1253,10 +1546,22 @@
                                   const agingCat = getAgingCategory(ageDays);
                                   return (
                                     <div key={a.id} className="border rounded p-3 flex justify-between items-center text-xs bg-slate-50/50">
-                                      <div>
-                                        <div className="font-bold text-[#001b4d]">{a.purpose}</div>
-                                        <div className="text-slate-500">
-                                          Employee: {emp?.name} · FC: <span className="font-mono text-[#001b4d]">{a.fundCenterNum} ({a.fundCenterName})</span> · PR: <span className="font-mono text-indigo-700">{a.prNumber}</span> · Disbursed: {a.disbursedOn} (<strong className="text-indigo-900">{ageDays} days outstanding</strong> — {agingCat})
+                                      <div className="flex items-start gap-3">
+                                        <input
+                                          type="checkbox"
+                                          className="mt-1"
+                                          checked={selectedReminderIds.includes(a.id)}
+                                          onChange={() => toggleReminderSelect(a.id)}
+                                          title="Select to send settlement reminder email"
+                                        />
+                                        <div>
+                                          <div className="font-bold text-[#001b4d]">{a.purpose}</div>
+                                          <div className="text-slate-500">
+                                            Employee: {emp?.name} · FC: <span className="font-mono text-[#001b4d]">{a.fundCenterNum} ({a.fundCenterName})</span> · PR: <span className="font-mono text-indigo-700">{a.prNumber}</span> · Disbursed: {a.disbursedOn} (<strong className="text-indigo-900">{ageDays} days outstanding</strong> — {agingCat})
+                                          </div>
+                                          {a.reminderCount > 0 && (
+                                            <div className="text-[11px] text-blue-700 mt-0.5">📧 Last reminder sent: {a.lastReminderOn} ({a.reminderCount} sent)</div>
+                                          )}
                                         </div>
                                       </div>
                                       <div className="text-right font-bold text-slate-800">{money(a.amount)}</div>
