@@ -7,6 +7,10 @@
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- OCR libraries: Tesseract (images / scanned PDFs), PDF.js (PDFs), Mammoth (.docx) -->
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
 </head>
 <body class="bg-slate-50 text-[#333333]">
     <div id="root"></div>
@@ -125,6 +129,17 @@
         // Later, replace the body of this function with the SAP authorisation lookup.
         function hasGrantFundAccess(employee) {
           return false;
+        }
+
+        // Password required to run the Master Reset (clears all saved portal data in this browser).
+        // Change it here if needed. Note: this is a front-end check only.
+        const MASTER_RESET_PASSWORD = "LUMS2026";
+
+        // ---- SAP INTEGRATION PLACEHOLDER ----
+        // Should return the SAP user ID of the person saving / posting the document (as currently done in SAP).
+        // For now it returns a fixed label; replace the body with the real SAP ID lookup later.
+        function getSapUserId() {
+          return "Accounts Payables";
         }
 
         // Placeholder email resolver. Replace with the real email from the employee master data / SAP.
@@ -276,8 +291,139 @@
             purpose: "Open day marketing material printing", disbursedOn: null,
             status: "pending_accounts", claim: { lines: [] }, sapDocRef: null, disbursementRef: null,
             settlementMode: null, refundDetails: null, rejectionReason: null
+          },
+          {
+            id: 17, employeeId: "e2", prNumber: "PR-340000017", amount: 50000,
+            dept: "SSE_Dean_Office", fundCenterNum: "CUF1003011", fundCenterName: "SSE_Dean_Office",
+            purpose: "Workshop venue and refreshments", disbursedOn: "2026-09-10",
+            status: "pending_posting", claim: {
+              lines: [{ id: 105, description: "Venue & catering invoice", category: "Other", amount: 50000, fileName: "venue_catering.pdf", fileUrl: "" }]
+            }, sapDocRef: null, disbursementRef: "TXN-99777",
+            settlementMode: null, refundDetails: null, rejectionReason: null,
+            savedDocRef: "SAVED-70011", savedOn: "2026-10-15", savedBy: "Accounts Payables", postingNote: "Receipts verified against invoice. Fully balanced."
           }
         ];
+
+        const DOC_ACCEPT = ".pdf,.doc,.docx,.jpg,.jpeg,.png";
+        const TAX_ACCEPT = ".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png";
+
+        function filesToDocs(fileList) {
+          return Array.from(fileList || []).map(f => ({
+            id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            name: f.name,
+            url: URL.createObjectURL(f)
+          }));
+        }
+
+        // ---------- OCR ENGINE (runs in the browser) ----------
+        async function ocrImageSource(src) {
+          if (!window.Tesseract) throw new Error("Tesseract not loaded");
+          const { data } = await Tesseract.recognize(src, "eng");
+          return (data.text || "").trim();
+        }
+
+        async function ocrPdfFile(file) {
+          if (!window.pdfjsLib) throw new Error("PDF.js not loaded");
+          pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+          const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+          const maxPages = Math.min(pdf.numPages, 5);
+          let out = [];
+          for (let i = 1; i <= maxPages; i++) {
+            const page = await pdf.getPage(i);
+            const tc = await page.getTextContent();
+            let text = tc.items.map(it => it.str).join(" ").trim();
+            if (text.length < 30) {
+              // scanned page: render to canvas and OCR it
+              const viewport = page.getViewport({ scale: 2 });
+              const canvas = document.createElement("canvas");
+              canvas.width = viewport.width; canvas.height = viewport.height;
+              await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+              text = await ocrImageSource(canvas);
+            }
+            out.push(text);
+          }
+          return out.join("\n\n").trim();
+        }
+
+        // Never throws. Returns { status: done|empty|unsupported|failed, text }
+        async function runOcr(file) {
+          try {
+            const name = (file.name || "").toLowerCase();
+            let text = "";
+            if (/\.(jpg|jpeg|png)$/.test(name)) text = await ocrImageSource(file);
+            else if (name.endsWith(".pdf")) text = await ocrPdfFile(file);
+            else if (name.endsWith(".docx")) {
+              if (!window.mammoth) throw new Error("Mammoth not loaded");
+              const r = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+              text = (r.value || "").trim();
+            } else {
+              return { status: "unsupported", text: "" };
+            }
+            return text ? { status: "done", text } : { status: "empty", text: "" };
+          } catch (err) {
+            console.error("OCR failed:", err);
+            return { status: "failed", text: "" };
+          }
+        }
+
+        // Adds files to a docs state array and OCR-scans each one in the background
+        function addDocsWithOcr(files, setter) {
+          if (!files || files.length === 0) return;
+          const docs = filesToDocs(files).map(d => ({ ...d, ocrStatus: "scanning", ocrText: "" }));
+          setter(prev => [...prev, ...docs]);
+          docs.forEach((d, i) => {
+            runOcr(files[i]).then(r => {
+              setter(prev => prev.map(x => x.id === d.id ? { ...x, ocrStatus: r.status, ocrText: r.text } : x));
+            });
+          });
+        }
+
+        // Tries to read a total amount out of OCR text (receipts / invoices)
+        function detectAmount(text) {
+          if (!text) return null;
+          const m = text.match(/(?:grand\s*total|net\s*amount|amount\s*due|total)[^0-9]{0,25}([0-9][0-9,]*(?:\.[0-9]+)?)/i);
+          if (!m) return null;
+          const n = Number(m[1].replace(/,/g, ""));
+          return isNaN(n) || n <= 0 ? null : n;
+        }
+
+        function OcrBadge({ item }) {
+          if (!item || !item.ocrStatus) return null;
+          const map = {
+            scanning: ["🔎 Scanning text…", "bg-amber-50 text-amber-700 border-amber-200 animate-pulse"],
+            done: ["✅ Text extracted", "bg-green-50 text-green-700 border-green-200"],
+            empty: ["⚠️ No readable text found", "bg-amber-50 text-amber-700 border-amber-200"],
+            unsupported: ["ℹ️ OCR not available for this file type", "bg-slate-50 text-slate-500 border-slate-200"],
+            failed: ["❌ OCR failed (check internet connection)", "bg-red-50 text-red-700 border-red-200"]
+          };
+          const [label, cls] = map[item.ocrStatus] || map.failed;
+          return <span className={`px-2 py-0.5 rounded-full border text-[10px] font-semibold ${cls}`}>{label}</span>;
+        }
+
+        function OcrDetails({ item }) {
+          if (!item || !item.ocrText) return null;
+          return (
+            <details className="basis-full text-[11px] text-slate-600">
+              <summary className="cursor-pointer text-blue-700 font-semibold">View extracted text</summary>
+              <pre className="whitespace-pre-wrap bg-white border rounded p-2 mt-1 max-h-40 overflow-auto font-sans">{item.ocrText}</pre>
+            </details>
+          );
+        }
+
+        function DocLinks({ docs, empty }) {
+          if (!docs || docs.length === 0) return <span className="text-slate-400">{empty || "None attached"}</span>;
+          return (
+            <div className="flex flex-col gap-1.5">
+              {docs.map(d => (
+                <div key={d.id} className="flex flex-wrap items-center gap-2">
+                  <a href={d.url} download={d.name} className="text-blue-600 underline font-bold">📎 {d.name}</a>
+                  <OcrBadge item={d} />
+                  <OcrDetails item={d} />
+                </div>
+              ))}
+            </div>
+          );
+        }
 
         function AdvancePortal() {
           const [role, setRole] = useState("employee"); 
@@ -311,6 +457,7 @@
           const [newFundType, setNewFundType] = useState("current");
           const [newAmount, setNewAmount] = useState("");
           const [newPurpose, setNewPurpose] = useState("");
+          const [newPurposeDocs, setNewPurposeDocs] = useState([]);
 
           const [showProfileForm, setShowProfileForm] = useState(false);
           const [newProfName, setNewProfName] = useState("");
@@ -332,6 +479,18 @@
           const [reviewSelectedId, setReviewSelectedId] = useState(null);
           const [reviewReasons, setReviewReasons] = useState([]);
           const [reviewOtherText, setReviewOtherText] = useState("");
+          const [reviewTaxDocs, setReviewTaxDocs] = useState([]);
+          const [reviewTaxNote, setReviewTaxNote] = useState("");
+
+          // Accounts: two-step settlement posting (review & save -> final approval & post)
+          const [postingNote, setPostingNote] = useState("");
+          const [postingSelectedId, setPostingSelectedId] = useState(null);
+          const [postingReturnReason, setPostingReturnReason] = useState("");
+
+          // Master reset (password protected)
+          const [showResetModal, setShowResetModal] = useState(false);
+          const [resetPassword, setResetPassword] = useState("");
+          const [resetError, setResetError] = useState("");
 
           // Admin dashboard: email reminders
           const [selectedReminderIds, setSelectedReminderIds] = useState([]);
@@ -344,6 +503,33 @@
           const [summaryDropdownOpen, setSummaryDropdownOpen] = useState({ open: true, partial: true, settled: true });
           const [selectedAgingBucket, setSelectedAgingBucket] = useState(null);
           const [dashboardSort, setDashboardSort] = useState("recent_old");
+
+          function performMasterReset(e) {
+            e.preventDefault();
+            if (resetPassword !== MASTER_RESET_PASSWORD) {
+              setResetError("Incorrect password. Master reset not authorised.");
+              return;
+            }
+            localStorage.removeItem("lums_employees");
+            localStorage.removeItem("lums_advances");
+            setEmployees(INITIAL_EMPLOYEES);
+            setAdvances(INITIAL_ADVANCES);
+            setCurrentEmployeeId("e2");
+            setRole("employee");
+            setOpenId(2);
+            setDraftLines({
+              2: [{ id: 99, description: "Transit handling fee", category: "Supplies", amount: "30000", fileName: "transit_invoice.pdf", fileUrl: "", isScanning: false }]
+            });
+            setSettlementChoices({ 2: { mode: "salary_deduction", ref: "", fileName: "" } });
+            setShowNewForm(false); setNewAmount(""); setNewPurpose(""); setNewPurposeDocs([]);
+            setTreasurySelectedId(null); setBankRefInput("");
+            setFinanceSelectedId(null); setFinanceRejectReason("");
+            setReviewSelectedId(null); resetReviewForm();
+            setPostingSelectedId(null); setPostingReturnReason(""); setPostingNote("");
+            setSelectedReminderIds([]); setSelectedAgingBucket(null);
+            setShowResetModal(false); setResetPassword(""); setResetError("");
+            alert("Master reset complete. All portal data has been restored to the original defaults.");
+          }
 
           function empOf(a) { return employees.find((e) => e.id === a.employeeId); }
           function update(id, patch) { setAdvances((as) => as.map((a) => (a.id === id ? { ...a, ...patch } : a))); }
@@ -374,16 +560,22 @@
             const fileUrl = URL.createObjectURL(file);
             setDraft(advanceId, getDraft(advanceId).map((l) => {
               if (l.id === id) {
-                return { ...l, fileName: file.name, fileUrl: fileUrl, description: l.description || file.name.split('.')[0], isScanning: false };
+                return { ...l, fileName: file.name, fileUrl: fileUrl, description: l.description || file.name.split('.')[0], isScanning: false, ocrStatus: "scanning", ocrText: "" };
               }
               return l;
             }));
+            runOcr(file).then(r => {
+              setDraftLines(d => ({
+                ...d,
+                [advanceId]: (d[advanceId] || []).map(l => (l.id === id && l.fileName === file.name) ? { ...l, ocrStatus: r.status, ocrText: r.text } : l)
+              }));
+            });
           }
 
           function removeAttachment(advanceId, id) {
             setDraft(advanceId, getDraft(advanceId).map((l) => {
               if (l.id === id) {
-                return { ...l, fileName: "", fileUrl: "" };
+                return { ...l, fileName: "", fileUrl: "", ocrStatus: "", ocrText: "" };
               }
               return l;
             }));
@@ -468,10 +660,11 @@
               fundCenterName: emp.fundCenterName, purpose: newPurpose, disbursedOn: null,
               status: "pending_hod", claim: { lines: [] }, sapDocRef: null, disbursementRef: null,
               settlementMode: null, refundDetails: null, rejectionReason: null,
-              fundType: newFundType
+              fundType: newFundType,
+              purposeDocs: newPurposeDocs
             };
             setAdvances([newAdv, ...advances]);
-            setNewAmount(""); setNewPurpose(""); setShowNewForm(false);
+            setNewAmount(""); setNewPurpose(""); setNewPurposeDocs([]); setShowNewForm(false);
           }
 
           function hodAction(id, approve) {
@@ -487,11 +680,13 @@
           function resetReviewForm() {
             setReviewReasons([]);
             setReviewOtherText("");
+            setReviewTaxDocs([]);
+            setReviewTaxNote("");
           }
 
           function accountsApproveAdvance(id) {
             const today = new Date().toISOString().split('T')[0];
-            update(id, { status: "pending_treasury", accountsReviewedOn: today, rejectionReasons: [], rejectionNote: "" });
+            update(id, { status: "pending_treasury", accountsReviewedOn: today, rejectionReasons: [], rejectionNote: "", taxWorking: { docs: reviewTaxDocs, note: reviewTaxNote.trim() } });
             resetReviewForm();
             setReviewSelectedId(null);
             alert("Advance request cleared by Accounts and forwarded to Treasury for disbursement.");
@@ -544,9 +739,41 @@
 
           function financeSettle(advanceId) {
             const docRef = `FI-DOC-${80000 + Math.floor(Math.random() * 9000)}`;
-            update(advanceId, { status: "settled", sapDocRef: docRef, rejectionReason: null });
+            update(advanceId, { status: "settled", sapDocRef: docRef, rejectionReason: null, returnReason: null, postedOn: new Date().toISOString().split('T')[0], postedBy: getSapUserId() });
+            setPostingSelectedId(null);
+            setPostingReturnReason("");
             setFinanceSelectedId(null);
             setFinanceRejectReason("");
+          }
+
+          // Step 1: review complete -> save document for posting
+          function financeSaveForPosting(advanceId) {
+            const savedRef = `SAVED-${70000 + Math.floor(Math.random() * 9000)}`;
+            update(advanceId, {
+              status: "pending_posting",
+              savedDocRef: savedRef,
+              savedOn: new Date().toISOString().split('T')[0],
+              savedBy: getSapUserId(),
+              postingNote: postingNote.trim(),
+              returnReason: null,
+              rejectionReason: null
+            });
+            setFinanceSelectedId(null);
+            setFinanceRejectReason("");
+            setPostingNote("");
+            alert(`Settlement reviewed and saved for posting (${savedRef}). It has been sent for final posting approval.`);
+          }
+
+          // Step 2: final posting - send back for review with reason
+          function financeReturnForReview(advanceId) {
+            if (!postingReturnReason.trim()) {
+              alert("Please provide a reason for returning the saved document for review.");
+              return;
+            }
+            update(advanceId, { status: "submitted", returnReason: postingReturnReason.trim(), savedDocRef: null });
+            setPostingSelectedId(null);
+            setPostingReturnReason("");
+            alert("Saved document returned to the Accounts reviewer with your remarks.");
           }
 
           function financeReject(advanceId) {
@@ -596,6 +823,7 @@
           const accountsReviewQueue = advances.filter((a) => a.status === "pending_accounts");
           const treasuryQueue = advances.filter((a) => a.status === "pending_treasury");
           const submittedQueue = advances.filter((a) => a.status === "submitted");
+          const postingQueue = advances.filter((a) => a.status === "pending_posting");
 
           const pendingBudgetList = employees.filter(e => e.workflowStatus === "pending_budget");
           const pendingItList = employees.filter(e => e.workflowStatus === "pending_it");
@@ -632,7 +860,7 @@
 
           const rawOpenAdvances = baseFilteredAdvances.filter(a => a.status === "outstanding");
           const rawPartialAdvances = baseFilteredAdvances.filter(a => {
-            if (a.status !== "submitted") return false;
+            if (a.status !== "submitted" && a.status !== "pending_posting") return false;
             const claimed = a.claim.lines.reduce((s, l) => s + Number(l.amount), 0);
             return claimed < a.amount;
           });
@@ -658,8 +886,8 @@
             <div className="min-h-screen bg-slate-50 pb-12" style={{ fontFamily: "system-ui, sans-serif" }}>
               <div className="border-b border-slate-200 bg-white px-6 py-4 flex flex-wrap justify-between items-center gap-4 shadow-sm">
                 <div>
-                  <div className="text-sm font-bold text-[#001b4d]">LUMS Enterprise Advance & Settlement Portal</div>
-                  <div className="text-xs text-slate-500">Official Chart of Accounts Fund Center Integration</div>
+                  <div className="text-2xl md:text-3xl font-bold tracking-tight text-[#001b4d]">LUMS Enterprise Advance & Settlement Portal</div>
+                  <div className="text-xs text-slate-500"></div>
                 </div>
                 
                 <div className="flex flex-wrap items-center gap-3">
@@ -680,13 +908,21 @@
                     <button onClick={() => { setRole("treasury"); setTreasurySelectedId(treasuryQueue[0]?.id || null); }} className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${role === "treasury" ? "bg-white text-[#001b4d] shadow-sm font-bold" : "text-slate-500"}`}>
                       💰 Treasury {treasuryQueue.length > 0 && <span className="ml-1 bg-blue-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{treasuryQueue.length}</span>}
                     </button>
-                    <button onClick={() => { setRole("finance"); setFinanceSelectedId(submittedQueue[0]?.id || null); setReviewSelectedId(accountsReviewQueue[0]?.id || null); resetReviewForm(); }} className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${role === "finance" ? "bg-white text-[#001b4d] shadow-sm font-bold" : "text-slate-500"}`}>
-                      🏛️ Accounts {(submittedQueue.length + accountsReviewQueue.length) > 0 && <span className="ml-1 bg-purple-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{submittedQueue.length + accountsReviewQueue.length}</span>}
+                    <button onClick={() => { setRole("finance"); setFinanceSelectedId(submittedQueue[0]?.id || null); setReviewSelectedId(accountsReviewQueue[0]?.id || null); setPostingSelectedId(postingQueue[0]?.id || null); resetReviewForm(); }} className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${role === "finance" ? "bg-white text-[#001b4d] shadow-sm font-bold" : "text-slate-500"}`}>
+                      🏛️ Accounts {(submittedQueue.length + accountsReviewQueue.length + postingQueue.length) > 0 && <span className="ml-1 bg-purple-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{submittedQueue.length + accountsReviewQueue.length + postingQueue.length}</span>}
                     </button>
                     <button onClick={() => setRole("admin_summary")} className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${role === "admin_summary" ? "bg-white text-[#001b4d] shadow-sm font-bold" : "text-slate-500"}`}>
                       📊 Admin Dashboard
                     </button>
                   </div>
+
+                  <button
+                    onClick={() => { setShowResetModal(true); setResetPassword(""); setResetError(""); }}
+                    title="Master reset (password required)"
+                    className="px-2.5 py-1.5 rounded-md text-[11px] font-medium text-slate-500 border border-slate-200 bg-white hover:bg-slate-100 transition"
+                  >
+                    🔄 Master Reset
+                  </button>
                 </div>
               </div>
 
@@ -795,7 +1031,7 @@
                       <div className="bg-white border border-blue-200 rounded-xl p-5 shadow-md">
                         <div className="flex justify-between items-center mb-3">
                           <h3 className="text-sm font-bold text-[#001b4d]">
-                            Create Sequential Purchase Requisition (PR) — {newFundType === "grant" ? "Grant Fund" : "Current Fund"}
+                            Apply for Advance — {newFundType === "grant" ? "Grant Fund" : "Current Fund"}
                           </h3>
                           <span className="text-xs font-mono bg-slate-100 px-2 py-1 rounded text-slate-600">Next PR: {generateNextPrNumber()}</span>
                         </div>
@@ -815,6 +1051,28 @@
                           <div>
                             <label className="font-semibold text-slate-600">Business Purpose</label>
                             <input type="text" required value={newPurpose} onChange={(e) => setNewPurpose(e.target.value)} placeholder="e.g. Operational expense advance" className="w-full mt-1 border rounded-md px-3 py-2 text-sm" />
+                          </div>
+                          <div>
+                            <label className="font-semibold text-slate-600">Supporting Documents </label>
+                            <div className="mt-1 flex flex-wrap items-center gap-2">
+                              <label className="inline-flex items-center gap-1.5 border border-dashed border-slate-300 px-3 py-1.5 rounded-md text-xs text-slate-600 cursor-pointer bg-slate-50 hover:bg-slate-100">
+                                <span>📎 Upload document(s)</span>
+                                <input type="file" multiple accept={DOC_ACCEPT} className="hidden" onChange={(e) => { const picked = Array.from(e.target.files || []); e.target.value = ""; addDocsWithOcr(picked, setNewPurposeDocs); }} />
+                              </label>
+                              <span className="text-[11px] text-slate-400">For purpose of the advance (.pdf, .doc, .docx, .jpg, .png).</span>
+                            </div>
+                            {newPurposeDocs.length > 0 && (
+                              <div className="mt-2 space-y-1">
+                                {newPurposeDocs.map(d => (
+                                  <div key={d.id} className="flex flex-wrap items-center gap-3">
+                                    <a href={d.url} download={d.name} className="text-blue-600 underline font-medium">📎 {d.name}</a>
+                                    <button type="button" onClick={() => setNewPurposeDocs(prev => prev.filter(x => x.id !== d.id))} className="text-red-600 hover:text-red-800 font-medium">❌ Remove File</button>
+                                    <OcrBadge item={d} />
+                                    <OcrDetails item={d} />
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                           </div>
                           <div className="flex justify-end pt-2">
                             <button type="submit" className="bg-[#001b4d] text-white px-4 py-2 rounded-lg font-bold hover:bg-blue-900">Submit PR for HoD Approval</button>
@@ -852,6 +1110,7 @@
                                 a.status === 'pending_treasury' ? 'bg-blue-50 text-blue-700 border-blue-200' :
                                 a.status === 'outstanding' ? 'bg-indigo-50 text-indigo-700 border-indigo-200' : 
                                 a.status === 'submitted' ? 'bg-purple-50 text-purple-700 border-purple-200' : 
+                                a.status === 'pending_posting' ? 'bg-teal-50 text-teal-700 border-teal-200' : 
                                 a.status === 'rejected' ? 'bg-red-50 text-red-700 border-red-200' :
                                 'bg-green-50 text-green-700 border-green-200'
                               }`}>
@@ -860,6 +1119,7 @@
                                  a.status === 'pending_treasury' ? 'Pending Treasury' : 
                                  a.status === 'outstanding' ? 'Outstanding' : 
                                  a.status === 'submitted' ? 'Pending Audit' : 
+                                 a.status === 'pending_posting' ? 'Pending Posting Approval' : 
                                  a.status === 'rejected' ? 'Rejected by Accounts' : `Settled (${a.sapDocRef})`}
                               </span>
                             </div>
@@ -871,6 +1131,13 @@
                                   <div className="bg-white border p-3 rounded-lg"><span className="text-slate-400 block">Fund Center:</span><span className="font-bold text-[#001b4d]">{a.fundCenterNum} ({a.fundCenterName})</span></div>
                                   <div className="bg-white border p-3 rounded-lg"><span className="text-slate-400 block">Department Unit:</span><span className="font-bold text-slate-700">{a.dept}</span></div>
                                 </div>
+
+                                {(a.purposeDocs || []).length > 0 && (
+                                  <div className="bg-white border p-3 rounded-lg text-xs">
+                                    <span className="text-slate-400 block mb-1">Purpose Supporting Documents:</span>
+                                    <DocLinks docs={a.purposeDocs} />
+                                  </div>
+                                )}
 
                                 {a.status === "rejected" && (
                                   <div className="bg-red-50 border border-red-300 rounded-lg p-4 text-xs text-red-900 space-y-2">
@@ -930,6 +1197,17 @@
                                               <button onClick={() => removeLine(a.id, line.id)} className="text-slate-400 hover:text-red-600 text-xs">🗑️ Remove Line</button>
                                             )}
                                           </div>
+                                          {line.fileName && line.ocrStatus && (
+                                            <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                                              <OcrBadge item={line} />
+                                              {!line.amount && detectAmount(line.ocrText) && (
+                                                <button type="button" onClick={() => editLine(a.id, line.id, "amount", String(detectAmount(line.ocrText)))} className="px-2 py-0.5 rounded border border-blue-300 text-blue-700 font-semibold bg-blue-50 hover:bg-blue-100">
+                                                  Use detected amount: {money(detectAmount(line.ocrText))}
+                                                </button>
+                                              )}
+                                              <OcrDetails item={line} />
+                                            </div>
+                                          )}
                                         </div>
                                       ))}
                                     </div>
@@ -1056,6 +1334,9 @@
                                     Requested by: <strong className="text-slate-700">{emp ? emp.name : "Unknown"}</strong> · Fund Center: <strong className="text-[#001b4d] font-mono">{a.fundCenterNum} ({a.fundCenterName})</strong>
                                   </div>
                                   <div className="text-sm font-bold text-slate-900 mt-1">Amount: {money(a.amount)} (<span className="font-mono text-indigo-700">{a.prNumber}</span>)</div>
+                                  {(a.purposeDocs || []).length > 0 && (
+                                    <div className="mt-1"><span className="text-slate-500">Purpose documents: </span><DocLinks docs={a.purposeDocs} /></div>
+                                  )}
                                 </div>
                                 <div className="flex gap-2">
                                   <button onClick={() => hodAction(a.id, false)} className="bg-red-50 text-red-700 border border-red-200 px-4 py-2 rounded font-bold">Reject</button>
@@ -1202,6 +1483,17 @@
                                   <div className="flex justify-between"><span>PR Number:</span><span className="font-mono font-bold text-indigo-700">{target.prNumber}</span></div>
                                   <div className="flex justify-between"><span>Amount:</span><span className="font-bold text-base text-[#001b4d]">{money(target.amount)}</span></div>
                                 </div>
+                                <div className="bg-blue-50/50 p-4 rounded-lg border border-blue-200 space-y-2">
+                                  <div className="font-bold text-[#001b4d]">Tax Working from Accounts:</div>
+                                  <DocLinks docs={target.taxWorking?.docs} empty="No tax working attached by Accounts." />
+                                  {target.taxWorking?.note && <div className="text-slate-700"><strong>Accounts Tax Note:</strong> {target.taxWorking.note}</div>}
+                                </div>
+                                {(target.purposeDocs || []).length > 0 && (
+                                  <div className="bg-slate-50 p-4 rounded-lg border space-y-1">
+                                    <div className="font-bold text-slate-700">Purpose Supporting Documents:</div>
+                                    <DocLinks docs={target.purposeDocs} />
+                                  </div>
+                                )}
                                 <div className="space-y-2 pt-2">
                                   <label className="font-bold text-slate-700">Bank Transfer / Cash Voucher Reference:</label>
                                   <input type="text" value={bankRefInput} onChange={e => setBankRefInput(e.target.value)} placeholder="e.g. TXN-88492-HBL" className="w-full border rounded-md p-2.5 text-sm" />
@@ -1230,7 +1522,10 @@
                         📝 Advance Eligibility Review {accountsReviewQueue.length > 0 && <span className="ml-1 bg-cyan-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{accountsReviewQueue.length}</span>}
                       </button>
                       <button onClick={() => setFinanceTab("settlement_audit")} className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${financeTab === "settlement_audit" ? "bg-white text-[#001b4d] shadow-sm font-bold" : "text-slate-500"}`}>
-                        🧾 Settlement Audit {submittedQueue.length > 0 && <span className="ml-1 bg-purple-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{submittedQueue.length}</span>}
+                        🧾 Accounts Settlement Review {submittedQueue.length > 0 && <span className="ml-1 bg-purple-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{submittedQueue.length}</span>}
+                      </button>
+                      <button onClick={() => { setFinanceTab("posting_approval"); if (!postingSelectedId) setPostingSelectedId(postingQueue[0]?.id || null); }} className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${financeTab === "posting_approval" ? "bg-white text-[#001b4d] shadow-sm font-bold" : "text-slate-500"}`}>
+                        ✅ Final Advance Posting {postingQueue.length > 0 && <span className="ml-1 bg-teal-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{postingQueue.length}</span>}
                       </button>
                     </div>
 
@@ -1258,7 +1553,7 @@
                               const target = accountsReviewQueue.find(i => i.id === reviewSelectedId);
                               if (!target) return <div className="p-8 text-center text-xs text-slate-400">Select advance request from the queue.</div>;
                               const emp = empOf(target);
-                              const otherPending = advances.filter(x => x.employeeId === target.employeeId && x.id !== target.id && (x.status === "outstanding" || x.status === "submitted"));
+                              const otherPending = advances.filter(x => x.employeeId === target.employeeId && x.id !== target.id && (x.status === "outstanding" || x.status === "submitted" || x.status === "pending_posting"));
                               const otherPendingTotal = otherPending.reduce((s, x) => s + Number(x.amount), 0);
 
                               return (
@@ -1276,17 +1571,52 @@
                                     <div className="flex justify-between"><span>Requested Amount:</span><span className="font-bold text-base text-[#001b4d]">{money(target.amount)}</span></div>
                                   </div>
 
+                                  <div className="border border-slate-200 p-3.5 rounded-lg space-y-1">
+                                    <div className="font-bold text-slate-700">Purpose Supporting Documents (uploaded by employee):</div>
+                                    <DocLinks docs={target.purposeDocs} empty="No supporting document uploaded by the employee." />
+                                  </div>
+
                                   <div className={`p-3.5 rounded-lg border ${otherPending.length > 0 ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-green-50 border-green-200 text-green-800'}`}>
                                     {otherPending.length > 0 ? (
                                       <div className="space-y-1">
                                         <div className="font-bold">⚠️ {emp?.name} has {otherPending.length} previous advance(s) not yet settled ({money(otherPendingTotal)})</div>
                                         {otherPending.map(x => (
-                                          <div key={x.id} className="font-mono text-[11px]">{x.prNumber} · {money(x.amount)} · {x.disbursedOn ? `${daysAgo(x.disbursedOn)} days outstanding` : 'not yet disbursed'} · {x.status === 'submitted' ? 'Pending Audit' : 'Outstanding'}</div>
+                                          <div key={x.id} className="font-mono text-[11px]">{x.prNumber} · {money(x.amount)} · {x.disbursedOn ? `${daysAgo(x.disbursedOn)} days outstanding` : 'not yet disbursed'} · {x.status === 'submitted' ? 'Pending Audit' : x.status === 'pending_posting' ? 'Pending Posting Approval' : 'Outstanding'}</div>
                                         ))}
                                       </div>
                                     ) : (
                                       <div className="font-bold">✓ No previous unsettled advances found for this employee.</div>
                                     )}
+                                  </div>
+
+                                  <div className="border border-blue-200 bg-blue-50/40 p-3.5 rounded-lg space-y-2">
+                                    <div className="font-bold text-[#001b4d]">Tax Working for Treasury (optional — shared with Treasury on "No Objection"):</div>
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <label className="inline-flex items-center gap-1.5 border border-dashed border-slate-300 px-3 py-1.5 rounded-md text-xs text-slate-600 cursor-pointer bg-white hover:bg-slate-100">
+                                        <span>📎 Attach tax working file(s)</span>
+                                        <input type="file" multiple accept={TAX_ACCEPT} className="hidden" onChange={e => { const picked = Array.from(e.target.files || []); e.target.value = ""; addDocsWithOcr(picked, setReviewTaxDocs); }} />
+                                      </label>
+                                      <span className="text-[11px] text-slate-400">.pdf, .doc, .docx, .xls, .xlsx, .jpg, .png</span>
+                                    </div>
+                                    {reviewTaxDocs.length > 0 && (
+                                      <div className="space-y-1">
+                                        {reviewTaxDocs.map(d => (
+                                          <div key={d.id} className="flex flex-wrap items-center gap-3">
+                                            <a href={d.url} download={d.name} className="text-blue-600 underline font-medium">📎 {d.name}</a>
+                                            <button type="button" onClick={() => setReviewTaxDocs(prev => prev.filter(x => x.id !== d.id))} className="text-red-600 hover:text-red-800 font-medium">❌ Remove File</button>
+                                            <OcrBadge item={d} />
+                                            <OcrDetails item={d} />
+                                          </div>
+                                        ))}
+                                      </div>
+                                    )}
+                                    <input
+                                      type="text"
+                                      value={reviewTaxNote}
+                                      onChange={e => setReviewTaxNote(e.target.value)}
+                                      placeholder="Tax note for Treasury (e.g. withholding tax to be deducted at source...)"
+                                      className="w-full border border-slate-300 rounded p-2 text-xs bg-white"
+                                    />
                                   </div>
 
                                   <div className="border border-slate-200 p-3.5 rounded-lg space-y-2">
@@ -1364,6 +1694,11 @@
                                   </div>
                                   <span className="bg-purple-100 text-purple-800 text-xs px-2.5 py-1 rounded-full font-bold">Pending Audit</span>
                                 </div>
+                                {target.returnReason && (
+                                  <div className="bg-red-50 border border-red-300 rounded-lg p-3 text-red-900">
+                                    <strong>↩ Returned from Final Posting:</strong> {target.returnReason}
+                                  </div>
+                                )}
                                 <div className="border rounded-lg overflow-hidden">
                                   <table className="w-full text-left text-xs">
                                     <thead className="bg-slate-50 text-slate-500 border-b">
@@ -1373,7 +1708,7 @@
                                       {target.claim.lines.map(l => (
                                         <tr key={l.id}>
                                           <td className="p-2.5 font-medium">{l.description}</td>
-                                          <td className="p-2.5">{l.fileUrl ? <a href={l.fileUrl} download={l.fileName} className="text-blue-600 underline font-bold">📎 {l.fileName}</a> : <span className="text-slate-400">N/A</span>}</td>
+                                          <td className="p-2.5">{l.fileUrl ? <a href={l.fileUrl} download={l.fileName} className="text-blue-600 underline font-bold">📎 {l.fileName}</a> : <span className="text-slate-400">N/A</span>}<OcrDetails item={l} /></td>
                                           <td className="p-2.5 text-right font-semibold">{money(l.amount)}</td>
                                         </tr>
                                       ))}
@@ -1415,9 +1750,14 @@
                                   </div>
                                 </div>
 
+                                <div className="border border-slate-200 p-3.5 rounded-lg space-y-2">
+                                  <label className="font-bold text-slate-700 block">Note  (optional):</label>
+                                  <input type="text" value={postingNote} onChange={e => setPostingNote(e.target.value)} placeholder="e.g. Receipts verified, tax deducted as per policy..." className="w-full border border-slate-300 rounded p-2 text-xs bg-white" />
+                                </div>
+
                                 <div className="pt-2 flex justify-end border-t">
-                                  <button onClick={() => financeSettle(target.id)} className="bg-[#001b4d] hover:bg-blue-900 text-white px-5 py-2.5 rounded-lg font-bold shadow-sm">
-                                    ✅ Approve & Post Settlement to SAP FI
+                                  <button onClick={() => financeSaveForPosting(target.id)} className="bg-[#001b4d] hover:bg-blue-900 text-white px-5 py-2.5 rounded-lg font-bold shadow-sm">
+                                    💾 Reviewed — Save as Complete 
                                   </button>
                                 </div>
                               </div>
@@ -1426,6 +1766,114 @@
                         </div>
                       </div>
                     )
+                    )}
+
+                    {financeTab === "posting_approval" && (
+                      postingQueue.length === 0 ? (
+                        <div className="border border-dashed border-slate-200 rounded-lg p-8 text-center bg-slate-50 text-sm text-slate-500">No saved documents pending final posting.</div>
+                      ) : (
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                          <div className="border border-slate-200 rounded-lg divide-y divide-slate-100 overflow-hidden bg-white">
+                            <div className="bg-slate-50 px-3 py-2 text-xs font-bold text-slate-500 uppercase">Saved for Posting ({postingQueue.length})</div>
+                            {postingQueue.map(item => {
+                              const emp = empOf(item);
+                              const isSelected = postingSelectedId === item.id;
+                              return (
+                                <button key={item.id} onClick={() => { setPostingSelectedId(item.id); setPostingReturnReason(""); }} className={`w-full text-left p-3 transition-colors ${isSelected ? 'bg-blue-50/80 border-l-4 border-[#001b4d]' : 'hover:bg-slate-50'}`}>
+                                  <div className="text-sm font-bold text-[#001b4d]">{emp?.name}</div>
+                                  <div className="text-xs text-slate-500 truncate">{item.purpose}</div>
+                                  <div className="mt-1 text-xs font-mono text-indigo-700 font-bold">{item.prNumber} · {item.savedDocRef}</div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <div className="md:col-span-2 border border-slate-200 rounded-lg p-5 bg-white shadow-2xs">
+                            {postingSelectedId ? (() => {
+                              const postItem = postingQueue.find(i => i.id === postingSelectedId);
+                              if (!postItem) return <div className="p-8 text-center text-xs text-slate-400">Select a saved document from the left.</div>;
+                              const postEmp = empOf(postItem);
+                              const postClaimed = postItem.claim.lines.reduce((s, l) => s + Number(l.amount), 0);
+                              const postVariance = postItem.amount - postClaimed;
+
+                              return (
+                                <div className="space-y-4 text-xs">
+                                  <div className="flex justify-between items-start border-b pb-3">
+                                    <div>
+                                      <h4 className="text-sm font-bold text-[#001b4d]">{postItem.purpose}</h4>
+                                      <p className="text-slate-500">Employee: <strong>{postEmp?.name}</strong> · FC: <span className="font-mono text-[#001b4d]">{postItem.fundCenterNum} ({postItem.fundCenterName})</span></p>
+                                    </div>
+                                    <span className="bg-teal-100 text-teal-800 text-xs px-2.5 py-1 rounded-full font-bold">Pending Posting Approval</span>
+                                  </div>
+
+                                  <div className="bg-teal-50/60 border border-teal-200 rounded-lg p-3.5 space-y-1">
+                                    <div className="flex justify-between"><span>Saved Document:</span><span className="font-mono font-bold text-teal-800">{postItem.savedDocRef}</span></div>
+                                    <div className="flex justify-between"><span>Reviewed & Saved By:</span><span className="font-bold">{postItem.savedBy || "Accounts Payables"}{postItem.savedOn ? ` on ${postItem.savedOn}` : ""}</span></div>
+                                    {postItem.postingNote && <div className="pt-1"><strong>Note:</strong> {postItem.postingNote}</div>}
+                                  </div>
+
+                                  <div className="border rounded-lg overflow-hidden">
+                                    <table className="w-full text-left text-xs">
+                                      <thead className="bg-slate-50 text-slate-500 border-b">
+                                        <tr><th className="p-2.5">Description</th><th className="p-2.5">Proof</th><th className="p-2.5 text-right">Amount</th></tr>
+                                      </thead>
+                                      <tbody className="divide-y">
+                                        {postItem.claim.lines.map(l => (
+                                          <tr key={l.id}>
+                                            <td className="p-2.5 font-medium">{l.description}</td>
+                                            <td className="p-2.5">{l.fileUrl ? <a href={l.fileUrl} download={l.fileName} className="text-blue-600 underline font-bold">📎 {l.fileName}</a> : <span className="text-slate-400">N/A</span>}<OcrDetails item={l} /></td>
+                                            <td className="p-2.5 text-right font-semibold">{money(l.amount)}</td>
+                                          </tr>
+                                        ))}
+                                      </tbody>
+                                    </table>
+                                  </div>
+
+                                  <div className="bg-slate-50 p-3.5 rounded-lg border space-y-1">
+                                    <div className="flex justify-between"><span>Advance:</span><span className="font-bold">{money(postItem.amount)}</span></div>
+                                    <div className="flex justify-between"><span>Claimed:</span><span className="font-bold">{money(postClaimed)}</span></div>
+                                    <div className="flex justify-between border-t pt-1 font-bold">
+                                      <span>Variance / Unspent:</span>
+                                      <span className={postVariance > 0 ? "text-amber-700" : "text-green-700"}>{money(postVariance)}</span>
+                                    </div>
+                                    {postVariance > 0 && (
+                                      <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-amber-900">
+                                        <strong>Selected Settlement Mode:</strong> {postItem.settlementMode === 'salary_deduction' ? 'Payroll Salary Deduction' : `Refund to LUMS (Ref: ${postItem.refundDetails?.ref || 'N/A'})`}
+                                        {postItem.refundDetails?.fileUrl && (
+                                          <div className="mt-1">
+                                            <a href={postItem.refundDetails.fileUrl} download={postItem.refundDetails.fileName} className="text-blue-600 underline font-bold">📥 Download Deposit Slip / Cheque Proof</a>
+                                          </div>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+
+                                  <div className="border border-red-200 bg-red-50/50 p-3.5 rounded-lg space-y-2">
+                                    <label className="font-bold text-red-900 block">Return to Accounts Reviewer (reason required):</label>
+                                    <textarea
+                                      rows="2"
+                                      value={postingReturnReason}
+                                      onChange={e => setPostingReturnReason(e.target.value)}
+                                      placeholder="Specify what the reviewer needs to re-check before this can be posted..."
+                                      className="w-full border border-red-300 rounded p-2 text-xs bg-white focus:outline-none focus:ring-1 focus:ring-red-500"
+                                    />
+                                    <div className="flex justify-end">
+                                      <button onClick={() => financeReturnForReview(postItem.id)} className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded font-bold shadow-sm">
+                                        ↩ Return for Review
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  <div className="pt-2 flex justify-end border-t">
+                                    <button onClick={() => financeSettle(postItem.id)} className="bg-[#001b4d] hover:bg-blue-900 text-white px-5 py-2.5 rounded-lg font-bold shadow-sm">
+                                      ✅ Approve & Post Settlement to SAP
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })() : <div className="p-8 text-center text-xs text-slate-400">Select a saved document from the left.</div>}
+                          </div>
+                        </div>
+                      )
                     )}
                   </div>
                 )}
@@ -1635,6 +2083,30 @@
                 )}
 
               </div>
+
+              {showResetModal && (
+                <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
+                  <div className="bg-white rounded-xl p-6 max-w-sm w-full shadow-lg space-y-4">
+                    <h4 className="text-sm font-bold text-[#001b4d]">🔄 Master Reset</h4>
+                    <p className="text-xs text-slate-500">This will erase all saved advances, claims and employee profiles in this browser and restore the original sample data. Enter the authorisation password to continue.</p>
+                    <form onSubmit={performMasterReset} className="space-y-3 text-xs">
+                      <input
+                        type="password"
+                        autoFocus
+                        value={resetPassword}
+                        onChange={e => { setResetPassword(e.target.value); setResetError(""); }}
+                        placeholder="Enter password"
+                        className="w-full border rounded p-2 text-sm bg-white"
+                      />
+                      {resetError && <div className="text-red-600 font-semibold">{resetError}</div>}
+                      <div className="flex justify-end gap-2 pt-1">
+                        <button type="button" onClick={() => { setShowResetModal(false); setResetPassword(""); setResetError(""); }} className="px-3 py-2 rounded border">Cancel</button>
+                        <button type="submit" className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded font-bold">Reset All Data</button>
+                      </div>
+                    </form>
+                  </div>
+                </div>
+              )}
             </div>
           );
         }
